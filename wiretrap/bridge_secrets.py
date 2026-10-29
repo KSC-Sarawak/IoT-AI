@@ -1,0 +1,6 @@
+# DO NOT COMMIT. Add bridge_secrets.py to .gitignore.
+# Supabase dashboard -> Project Settings -> API Keys -> service_role (secret)
+SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNndHZvaXJrdHpxanFhb3NzbGZoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc5MDY4NjEzMCwiZXhwIjoyMTA2MjYyMTMwfQ.IFa7sjkWRcQQpNj8wK8xkxdl6fIycuHYlXffscoh-20"
+
+# Only needed when MODE = "api"
+SENSOR_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNndHZvaXJrdHpxanFhb3NzbGZoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc5MDY4NjEzMCwiZXhwIjoyMTA2MjYyMTMwfQ.IFa7sjkWRcQQpNj8wK8xkxdl6fIycuHYlXffscoh-20"

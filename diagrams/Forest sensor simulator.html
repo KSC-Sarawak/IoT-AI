@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Forest sensor simulator</title>
+<style>
+:root{--bg:#eef2ef;--panel:#fff;--ink:#17261d;--mute:#5b6b61;--line:#cdd8d0;--air:#2f6f8f;--soil:#8a5a33;--ok:#2e7d4f;--warn:#b7791f;--bad:#b83a3a;--code:#e4ebe6;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#101a14;--panel:#18251d;--ink:#e6efe9;--mute:#9db0a4;--line:#2c3f33;--air:#6db3d4;--soil:#d39a68;--ok:#5cc489;--warn:#e3b04b;--bad:#ee7b7b;--code:#0d1510}}
+:root[data-theme="dark"]{--bg:#101a14;--panel:#18251d;--ink:#e6efe9;--mute:#9db0a4;--line:#2c3f33;--air:#6db3d4;--soil:#d39a68;--ok:#5cc489;--warn:#e3b04b;--bad:#ee7b7b;--code:#0d1510}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:620px;margin:0 auto;padding:20px 16px 32px}
+h1{font-size:24px;margin:0 0 4px}
+p.lead{margin:0 0 18px;color:var(--mute)}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+h2{font-size:15px;margin:0 0 12px;font-weight:600}
+.join{height:14px;margin:-8px 0 6px 28px;border-left:2px dashed var(--line)}
+label{display:flex;justify-content:space-between;font-weight:600;margin-bottom:6px}
+.val{font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;height:32px;margin:0 0 14px}
+#t{accent-color:var(--air)}#s{accent-color:var(--soil)}
+.row{display:flex;gap:10px}
+.box{flex:1;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.box small{display:block;color:var(--mute)}
+.box b{font-size:20px;font-variant-numeric:tabular-nums}
+.led{display:flex;align-items:center;gap:10px;margin-top:12px}
+.dot{width:18px;height:18px;border-radius:50%;background:var(--ok);flex:none}
+pre{margin:0;background:var(--code);border-radius:8px;padding:12px;overflow-x:auto;font:13px/1.5 ui-monospace,Consolas,monospace}
+button{font:inherit;font-weight:600;padding:10px 16px;border-radius:8px;border:0;background:var(--ok);color:#fff;cursor:pointer;min-height:44px}
+button:focus-visible,input:focus-visible{outline:3px solid var(--air);outline-offset:2px}
+.act{display:flex;align-items:center;gap:14px;margin-top:12px;flex-wrap:wrap}
+.act label{display:flex;gap:8px;font-weight:400;margin:0;align-items:center}
+#log{margin-top:12px;color:var(--mute);font:12px/1.6 ui-monospace,Consolas,monospace;word-break:break-all}
+</style>
+</head>
+<body>
+<main>
+<h1>Forest sensor simulator</h1>
+<p class="lead">Move the sliders. Watch what the ESP32 reads and sends.</p>
+
+<section>
+<h2>Sensors in the forest</h2>
+<label for="t">Air temperature <span class="val" id="tv"></span></label>
+<input id="t" type="range" min="0" max="50" step="0.5" value="27">
+<label for="s">Soil moisture <span class="val" id="sv"></span></label>
+<input id="s" type="range" min="0" max="100" step="1" value="55">
+</section>
+<div class="join"></div>
+
+<section>
+<h2>What the ESP32 reads</h2>
+<div class="row">
+<div class="box"><small>DHT22 temperature</small><b id="rt"></b></div>
+<div class="box"><small>Soil sensor raw value</small><b id="rs"></b></div>
+</div>
+<div class="led"><span class="dot" id="dot"></span><span id="msg"></span></div>
+</section>
+<div class="join"></div>
+
+<section>
+<h2>Message sent over MQTT</h2>
+<pre id="json"></pre>
+<div class="act">
+<button id="pub" type="button">Publish message</button>
+<label><input id="auto" type="checkbox"> Auto publish every 2 seconds</label>
+</div>
+<div id="log" aria-live="polite">No messages sent yet.</div>
+</section>
+</main>
+<script>
+var t=document.getElementById('t'),s=document.getElementById('s'),lines=[];
+function state(){
+var temp=parseFloat(t.value),soil=parseInt(s.value,10);
+var raw=Math.round(3200-soil/100*1800);
+var level='ok',text='Normal. Forest conditions look fine.';
+if(soil<30||soil>80||temp>35){level='warn';text=soil<30?'Warning: soil is dry.':soil>80?'Warning: soil is very wet.':'Warning: air is hot.';}
+if(soil<20||temp>38){level='bad';text=soil<20?'Alert: soil is very dry.':'Alert: air is too hot.';}
+return {temp:temp,soil:soil,raw:raw,level:level,text:text};
+}
+function payload(d){
+return {node_id:'node-01',ts:new Date().toISOString(),temperature_c:d.temp,soil_moisture_pct:d.soil,status:d.level};
+}
+function render(){
+var d=state();
+document.getElementById('tv').textContent=d.temp.toFixed(1)+' \u00B0C';
+document.getElementById('sv').textContent=d.soil+' %';
+document.getElementById('rt').textContent=d.temp.toFixed(1)+' \u00B0C';
+document.getElementById('rs').textContent=d.raw+' / 4095';
+document.getElementById('msg').textContent=d.text;
+document.getElementById('dot').style.background='var(--'+d.level+')';
+document.getElementById('json').textContent=JSON.stringify(payload(d),null,2);
+}
+function publish(){
+var d=state(),p=payload(d);
+lines.unshift(new Date().toLocaleTimeString()+'  ctip/node-01/telemetry  '+JSON.stringify(p));
+lines=lines.slice(0,5);
+document.getElementById('log').innerHTML=lines.map(function(l){return l.replace(/&/g,'&amp;').replace(/</g,'&lt;');}).join('<br>');
+}
+var timer=null;
+t.addEventListener('input',render);s.addEventListener('input',render);
+document.getElementById('pub').addEventListener('click',publish);
+document.getElementById('auto').addEventListener('change',function(e){
+if(e.target.checked){publish();timer=setInterval(function(){render();publish();},2000);}
+else{clearInterval(timer);timer=null;}
+});
+render();
+</script>
+</body>
+</html>
