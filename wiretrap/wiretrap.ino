@@ -1,11 +1,17 @@
 /*
  * Rainforest Plant Monitor - ESP32 sensor node
- * Jira: CTIP-17 (readings), CTIP-59 (motion), CTIP-60 (MQTT publishing)
+ * Jira: CTIP-17 (readings), CTIP-59 (motion), CTIP-60 (MQTT publishing),
+ *       CTIP-62 (camera trigger: tripwire + motion)
  *
- * Publishes ONE JSON message per reading to:  nodes/{NODE_ID}/telemetry
+ * Telemetry: ONE JSON message per reading to  nodes/{NODE_ID}/telemetry
  * Payload matches TelemetryReadingInput in the OpenAPI contract:
  *   { "ts": "...Z", "temperature": 28.4, "humidity": 91.0,
  *     "soil_moisture": 62, "distance_cm": 45.2, "motion_detected": false }
+ *
+ * Camera trigger (NOT telemetry, not in the contract):  nodes/{NODE_ID}/trigger
+ *   { "ts": "...Z", "source": "tripwire", "deflection": 1520 }
+ *   { "ts": "...Z", "source": "motion" }
+ * capture.py on the laptop listens to this topic and takes a webcam photo.
  *
  * Libraries (Arduino Library Manager):
  *   - "DHT sensor library" by Adafruit
@@ -34,6 +40,20 @@ const unsigned long MQTT_RETRY_MS       = 5000;
 const float MOTION_THRESHOLD_CM = 15.0;  // change that counts as motion
 const float MAX_VALID_CM        = 400.0; // HC-SR04 range limit
 
+// ---------- Tripwire (joystick with a string tied to the stick, CTIP-62)
+const unsigned long TRAP_SAMPLE_MS   = 50;    // check the stick 20 times a second
+// ADC reads 0..4095, rest is about 1900, so the biggest possible deflection is about 2000.
+const int           TRAP_THRESHOLD   = 1500;  // ADC counts away from rest = pulled (raise = less sensitive)
+const int           TRAP_REARM       = 500;   // back within this = stick released
+const int           TRAP_CONFIRM     = 4;     // pulled for 4 samples in a row (200 ms)
+const bool          TRAP_DEBUG       = true;  // print live stick values; set false when tuned
+const unsigned long TRAP_DEBUG_MS    = 250;
+const unsigned long TRAP_BLINK_MS     = 150;  // LED on/off speed
+const unsigned long TRAP_BLINK_MIN_MS = 3000; // keep blinking at least this long after a pull
+const unsigned long TRAP_REARM_MS    = 1000;  // must stay released this long to re-arm
+const bool          MOTION_TRIGGERS_CAMERA = true; // HC-SR04 is the second trigger
+const unsigned long CAMERA_TRIGGER_GAP_MS  = 5000; // at most one trigger per 5 s
+
 // ---------- Pins
 #define DHTPIN          4
 #define DHTTYPE         DHT11
@@ -41,6 +61,10 @@ const float MAX_VALID_CM        = 400.0; // HC-SR04 range limit
 #define SOIL_ANALOG_PIN 34   // ADC1, safe with Wi-Fi on
 #define TRIG_PIN        18
 #define ECHO_PIN        19   // through a voltage divider (5 V -> 3.3 V)
+#define TRAP_X_PIN      35   // joystick VRx, ADC1, input only
+#define TRAP_Y_PIN      32   // joystick VRy, ADC1
+#define LED_PIN         5    // LED + 220 ohm resistor to GND
+// Joystick VCC goes to 3.3 V, NOT 5 V (5 V would overdrive the ADC pins).
 
 const int SOIL_DRY_RAW = 3800;
 const int SOIL_WET_RAW = 1300;
@@ -50,10 +74,27 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
 char topic[96];
+char triggerTopic[96];
 float lastDistance = -1.0;
 bool motionSinceLastPublish = false;
 bool ntpStarted = false;
 unsigned long lastPublish = 0, lastSample = 0, lastMqttTry = 0;
+
+// Tripwire state
+int trapRestX = 0, trapRestY = 0;      // resting position, measured at boot
+bool trapArmed = true;
+int trapPulledCount = 0;
+int lastDeflection = 0;
+unsigned long trapReleasedSince = 0, lastTrapSample = 0, lastTrapDebug = 0;
+unsigned long trapTriggeredAt = 0, lastBlink = 0;
+bool ledOn = false;
+
+// Camera trigger state (sent as soon as MQTT is connected)
+bool pendingTrigger = false;
+const char* pendingSource = "";
+int pendingDeflection = 0;
+unsigned long lastTriggerSent = 0;
+bool anyTriggerSent = false;
 
 // ---------------------------------------------------------------- Wi-Fi
 void connectWiFi() {
@@ -129,12 +170,128 @@ float getDistanceCm() {
   return (cm > MAX_VALID_CM) ? -1.0 : cm;
 }
 
+// ---------------------------------------------------------------- Camera trigger
+// Queue a trigger. It is sent from loop() once MQTT is connected.
+// Rate limited so a shaking wire cannot flood the laptop.
+void requestCameraTrigger(const char* source, int deflection) {
+  if (anyTriggerSent && millis() - lastTriggerSent < CAMERA_TRIGGER_GAP_MS) {
+    Serial.printf("Trigger (%s) ignored: cooldown\n", source);
+    return;
+  }
+  if (pendingTrigger) return; // one already waiting
+  pendingTrigger = true;
+  pendingSource = source;
+  pendingDeflection = deflection;
+}
+
+void sendPendingTrigger() {
+  if (!pendingTrigger || !mqttClient.connected()) return;
+
+  char json[128];
+  char ts[25];
+  int n;
+  if (isoNow(ts, sizeof(ts))) {
+    n = snprintf(json, sizeof(json), "{\"ts\":\"%s\",\"source\":\"%s\"", ts, pendingSource);
+  } else {
+    n = snprintf(json, sizeof(json), "{\"source\":\"%s\"", pendingSource); // laptop adds the time
+  }
+  if (strcmp(pendingSource, "tripwire") == 0) {
+    n += snprintf(json + n, sizeof(json) - n, ",\"deflection\":%d", pendingDeflection);
+  }
+  snprintf(json + n, sizeof(json) - n, "}");
+
+  if (mqttClient.publish(triggerTopic, json)) {
+    Serial.printf("TRIGGER %s %s\n", triggerTopic, json);
+    pendingTrigger = false;
+    lastTriggerSent = millis();
+    anyTriggerSent = true;
+  } else {
+    Serial.printf("TRIGGER SEND FAILED %s (will retry)\n", triggerTopic);
+  }
+}
+
+// ---------------------------------------------------------------- Tripwire
+int readAverage(int pin, int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(5);
+  }
+  return sum / samples;
+}
+
+void calibrateTrap() {
+  trapRestX = readAverage(TRAP_X_PIN, 20);
+  trapRestY = readAverage(TRAP_Y_PIN, 20);
+  Serial.printf("Tripwire: rest position X=%d Y=%d (leave the wire slack at boot)\n",
+                trapRestX, trapRestY);
+}
+
+void sampleTrap() {
+  int dx = abs(analogRead(TRAP_X_PIN) - trapRestX);
+  int dy = abs(analogRead(TRAP_Y_PIN) - trapRestY);
+  int deflection = max(dx, dy);
+  lastDeflection = deflection;
+
+  if (TRAP_DEBUG && millis() - lastTrapDebug >= TRAP_DEBUG_MS) {
+    lastTrapDebug = millis();
+    Serial.printf("Trap: dx=%4d dy=%4d deflection=%4d / %d  %s\n",
+                  dx, dy, deflection, TRAP_THRESHOLD, trapArmed ? "armed" : "TRIPPED");
+  }
+
+  if (trapArmed) {
+    if (deflection > TRAP_THRESHOLD) {
+      trapPulledCount++;
+      if (trapPulledCount >= TRAP_CONFIRM) {
+        Serial.println("==================================");
+        Serial.printf("   TRIPWIRE PULLED (deflection %d)\n", deflection);
+        Serial.println("==================================");
+        requestCameraTrigger("tripwire", deflection);
+        trapArmed = false;
+        trapPulledCount = 0;
+        trapReleasedSince = 0;
+        trapTriggeredAt = millis();   // updateTrapLed() starts blinking
+      }
+    } else {
+      trapPulledCount = 0; // a single noisy sample does not count
+    }
+  } else {
+    // Re-arm only after the stick has stayed back near rest for a while.
+    if (deflection < TRAP_REARM) {
+      if (trapReleasedSince == 0) trapReleasedSince = millis();
+      if (millis() - trapReleasedSince >= TRAP_REARM_MS) {
+        trapArmed = true;
+        Serial.println("Tripwire: re-armed");
+      }
+    } else {
+      trapReleasedSince = 0;
+    }
+  }
+}
+
+// Blink while the trap is tripped, and for at least TRAP_BLINK_MIN_MS after a pull.
+// Uses millis(), not delay(), so the rest of the code keeps running.
+void updateTrapLed() {
+  bool blinking = !trapArmed ||
+                  (trapTriggeredAt > 0 && millis() - trapTriggeredAt < TRAP_BLINK_MIN_MS);
+  if (!blinking) {
+    if (ledOn) { ledOn = false; digitalWrite(LED_PIN, LOW); }
+    return;
+  }
+  if (millis() - lastBlink >= TRAP_BLINK_MS) {
+    lastBlink = millis();
+    ledOn = !ledOn;
+    digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+  }
+}
+
 void sampleDistance() {
   float d = getDistanceCm();
   if (d < 0) return; // ignore timed-out or out-of-range pings
   if (lastDistance >= 0 && fabs(d - lastDistance) > MOTION_THRESHOLD_CM) {
     motionSinceLastPublish = true;
     Serial.printf("Motion: %.1f -> %.1f cm\n", lastDistance, d);
+    if (MOTION_TRIGGERS_CAMERA) requestCameraTrigger("motion", 0);
   }
   lastDistance = d;
 }
@@ -183,9 +340,15 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
-
+  pinMode(TRAP_X_PIN, INPUT);
+  pinMode(TRAP_Y_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);   // without this the pin never drives the LED
+  digitalWrite(LED_PIN, LOW);
+  calibrateTrap();
   snprintf(topic, sizeof(topic), "nodes/%s/telemetry", NODE_ID);
+  snprintf(triggerTopic, sizeof(triggerTopic), "nodes/%s/trigger", NODE_ID);
   Serial.printf("Topic: %s\n", topic);
+  Serial.printf("Trigger topic: %s\n", triggerTopic);
 
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setBufferSize(512); // default 256 is tight for JSON
@@ -195,13 +358,24 @@ void setup() {
 }
 
 void loop() {
+  // The tripwire is checked even when Wi-Fi or MQTT is down;
+  // the trigger waits in pendingTrigger until it can be sent.
+  unsigned long now = millis();
+  if (now - lastTrapSample >= TRAP_SAMPLE_MS) {
+    lastTrapSample = now;
+    sampleTrap();
+  }
+  updateTrapLed(); // before connectWiFi(), so it blinks even when Wi-Fi is down
+
   connectWiFi();
   if (WiFi.status() != WL_CONNECTED) return;
 
   connectMQTT();
   mqttClient.loop(); // never block this with long delay()
 
-  unsigned long now = millis();
+  sendPendingTrigger(); // camera trigger goes out first, before telemetry
+
+  now = millis();
   if (now - lastSample >= DISTANCE_SAMPLE_MS) {
     lastSample = now;
     sampleDistance();
