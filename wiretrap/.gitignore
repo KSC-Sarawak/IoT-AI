@@ -4,3 +4,4 @@ secrets.h
 /captures
 /__pycache__
 /certs
+ca.crt
