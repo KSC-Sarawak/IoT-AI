@@ -3,3 +3,4 @@ bridge_secrets.pyc
 secrets.h
 /captures
 /__pycache__
+/certs
