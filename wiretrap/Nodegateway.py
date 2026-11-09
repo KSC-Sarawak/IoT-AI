@@ -32,6 +32,19 @@ Run (PowerShell, Python 3):
 Keys in bridge_secrets.py (same folder, do NOT commit it):
     SUPABASE_SERVICE_KEY = "eyJ..."
     SENSOR_KEY = "..."
+    MQTT_USER = "gateway"
+    MQTT_PASSWORD = "..."          (the "gateway" password set with mosquitto_passwd)
+    (MQTT_USER / MQTT_PASSWORD are only needed when USE_TEAM_BROKER = True)
+
+Security (CTIP-50, F-14 and F-15, 4 Nov 2026):
+  - F-14: connects to the team's own Mosquitto broker over TLS (port 8883)
+    with a username and password. The broker only lets each node publish
+    to its own topic (infra/mosquitto/acl).
+    Until that broker is ready, USE_TEAM_BROKER = False keeps using the old
+    public broker (no TLS, no login). F-14 stays open while it is False.
+  - F-15: only node IDs listed in REGISTERED_NODES are accepted, only the
+    trigger sources in ALLOWED_SOURCES, at most MAX_PHOTOS_PER_MINUTE photos
+    in total, and readings outside SENSOR_LIMITS are dropped.
 """
 import json
 import os
@@ -52,8 +65,19 @@ MODE = "supabase"        # telemetry: "supabase" now, "api" when POST /telemetry
 IMAGE_MODE = "supabase"  # images:    "supabase" now, "api" when POST /sensor-nodes/{id}/images works
 IMAGE_BUCKET = "sensor-images"
 
-BROKER = "broker.hivemq.com"
-PORT = 1883
+# F-14 switch. False = old public broker (no TLS, no login) until the team broker is ready.
+# True = team Mosquitto broker on this laptop (TLS + login). Needs MQTT_USER /
+# MQTT_PASSWORD in bridge_secrets.py and ca.crt in this folder.
+USE_TEAM_BROKER = True
+
+if USE_TEAM_BROKER:
+    # F-14: the team's own broker (infra/mosquitto), not the public broker.hivemq.com
+    BROKER = "localhost"    # Mosquitto runs on this same laptop
+    PORT = 8883             # TLS port
+else:
+    BROKER = "broker.hivemq.com"   # TEMPORARY: public broker, no TLS, no login
+    PORT = 1883
+CA_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ca.crt")  # copy of infra/mosquitto/certs/ca.crt
 TELEMETRY_TOPIC = "nodes/+/telemetry"
 TRIGGER_TOPIC = "nodes/+/trigger"
 
@@ -69,6 +93,24 @@ FRAME_HEIGHT = 720
 JPEG_QUALITY = 85
 MAX_IMAGE_BYTES = 2 * 1024 * 1024   # contract limit: 2 MB
 COOLDOWN_S = 5              # at most one photo per node every 5 s
+
+# ---- F-15 input checks
+# Node IDs (sensor_nodes.id) this gateway accepts. Anything else is ignored.
+# Each node's MQTT username must be the same ID, so the broker ACL matches.
+REGISTERED_NODES = {
+    "0ac66bdc-db55-4a8e-a7c6-4c30daa8124b",   # put the real node UUID(s) here
+}
+ALLOWED_SOURCES = ("motion", "tripwire")   # trigger "source" values the node sends
+MAX_PHOTOS_PER_MINUTE = 6                  # for ALL nodes together (disk and bucket)
+# Allowed range for each reading. A reading outside it is dropped (logged).
+SENSOR_LIMITS = {
+    "temperature":   (-10, 60),     # deg C (DHT11 reads 0 to 50)
+    "humidity":      (0, 100),      # %
+    "soil_moisture": (0, 100),      # %
+    "distance_cm":   (0, 500),      # HC-SR04 range is about 2 to 400 cm
+    "lat":           (-90, 90),
+    "lng":           (-180, 180),
+}
 
 # Fields allowed by TelemetryReadingInput in the OpenAPI contract
 ALLOWED = ("ts", "temperature", "humidity", "soil_moisture",
@@ -88,8 +130,34 @@ try:
     from bridge_secrets import SENSOR_KEY
 except ImportError:
     SENSOR_KEY = ""
+try:
+    from bridge_secrets import MQTT_USER, MQTT_PASSWORD
+except ImportError:
+    MQTT_USER, MQTT_PASSWORD = "", ""
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+
+
+def known_node(node_id):
+    """F-15: accept only registered node UUIDs (also stops odd text in URLs and file names)."""
+    return bool(UUID_RE.match(node_id)) and node_id.lower() in {n.lower() for n in REGISTERED_NODES}
+
+
+def check_reading(reading):
+    """F-15: returns None if the reading is fine, or the reason it is not."""
+    if not isinstance(reading.get("ts"), str) or not TS_RE.match(reading["ts"]):
+        return "ts is not a date-time"
+    for key, (low, high) in SENSOR_LIMITS.items():
+        if key in reading:
+            v = reading[key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return "%s is not a number" % key
+            if not (low <= v <= high):
+                return "%s=%s is outside %s..%s" % (key, v, low, high)
+    if "motion_detected" in reading and not isinstance(reading["motion_detected"], bool):
+        return "motion_detected is not true/false"
+    return None
 
 
 def log(part, text):
@@ -165,6 +233,10 @@ def handle_telemetry(node_id, payload):
         log("TELEMETRY", "%s skipped, no ts" % node_id)
         return
     reading = dict((k, v) for k, v in data.items() if k in ALLOWED)
+    problem = check_reading(reading)
+    if problem:
+        log("TELEMETRY", "%s skipped, %s" % (node_id, problem))
+        return
 
     if MODE == "api":
         ok, code, text = send_to_api(node_id, reading)
@@ -230,8 +302,14 @@ class Camera:
 def save_photo(folder, node_id, captured_at, source, data):
     """Save the photo first, so it is never lost if the upload fails."""
     safe_ts = captured_at.replace(":", "")  # Windows file names cannot contain ':'
-    name = "%s__%s__%s__%s.jpg" % (node_id, safe_ts, source, uuid.uuid4().hex[:6])
+    # F-15: only plain letters, digits and dashes go into the file name, so a
+    # value like "..\\x" can never save the photo outside the folder
+    safe_node = re.sub(r"[^0-9A-Za-z-]", "", node_id)
+    safe_source = source if source in ALLOWED_SOURCES or source == "test" else "unknown"
+    name = "%s__%s__%s__%s.jpg" % (safe_node, safe_ts, safe_source, uuid.uuid4().hex[:6])
     path = os.path.join(folder, name)
+    if os.path.dirname(os.path.abspath(path)) != os.path.abspath(folder):
+        raise RuntimeError("unsafe photo file name")
     with open(path, "wb") as f:
         f.write(data)
     return path
@@ -367,8 +445,11 @@ def retry_pending():
 
 
 def handle_trigger(camera, node_id, source, payload):
-    if not UUID_RE.match(node_id):
-        log("CAMERA", "%s skipped: node_id is not a UUID" % node_id)
+    if not known_node(node_id):
+        log("CAMERA", "%r skipped: not a registered node" % node_id[:60])
+        return
+    if source not in ALLOWED_SOURCES:
+        log("CAMERA", "%s skipped: unknown trigger source %r" % (node_id, source[:30]))
         return
     log("CAMERA", "TRIGGER from %s: %s" % (node_id, json.dumps(payload)))
     if camera is None:
@@ -415,6 +496,9 @@ def on_message(client, userdata, msg):
     if len(parts) != 3 or parts[0] != "nodes":
         return
     node_id, kind = parts[1], parts[2]
+    if not known_node(node_id):   # F-15: drop unregistered or odd node IDs straight away
+        log("MQTT", "ignored message from unregistered node %r" % node_id[:60])
+        return
     payload = msg.payload.decode("utf-8", "replace")
 
     if kind == "telemetry":
@@ -436,6 +520,10 @@ def make_client():
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
     else:                                     # paho-mqtt 1.x
         client = mqtt.Client(client_id=client_id)
+    if USE_TEAM_BROKER:
+        # F-14: TLS and a login for the team broker
+        client.tls_set(ca_certs=CA_CERT)
+        client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.on_connect_fail = on_connect_fail
@@ -482,6 +570,18 @@ def main():
         return
     if IMAGE_MODE == "api" and not SENSOR_KEY:
         log("CAMERA", "WARNING: SENSOR_KEY missing in bridge_secrets.py; image uploads have no key")
+    if USE_TEAM_BROKER:
+        if not MQTT_USER or not MQTT_PASSWORD:
+            print("Missing MQTT_USER / MQTT_PASSWORD. Add them to bridge_secrets.py (see top of this file).")
+            return
+        if not os.path.exists(CA_CERT):
+            print("Missing %s. Copy infra/mosquitto/certs/ca.crt into this folder." % CA_CERT)
+            return
+    else:
+        log("MQTT", "WARNING: public broker %s, no TLS, no login (F-14 still open)" % BROKER)
+    if not REGISTERED_NODES:
+        print("REGISTERED_NODES is empty. Put the node UUID(s) in the settings at the top.")
+        return
     log("MAIN", "telemetry -> %s, images -> %s" % (MODE, IMAGE_MODE))
 
     camera = None if "--no-camera" in sys.argv else open_camera()
@@ -495,6 +595,7 @@ def main():
 
     # The main thread runs the camera, so a slow photo never delays telemetry.
     last_photo = {}         # node_id -> time of last photo
+    recent_photos = []      # F-15: times of photos in the last minute, all nodes
     last_retry = time.time()
     log("MAIN", "running. Ctrl+C to stop.")
     try:
@@ -505,10 +606,15 @@ def main():
                 node_id = None
 
             if node_id:
-                if time.time() - last_photo.get(node_id, 0) < COOLDOWN_S:
+                now = time.time()
+                recent_photos[:] = [t for t in recent_photos if now - t < 60]
+                if now - last_photo.get(node_id, 0) < COOLDOWN_S:
                     log("CAMERA", "trigger from %s (%s) skipped: cooldown" % (node_id, source))
+                elif len(recent_photos) >= MAX_PHOTOS_PER_MINUTE:
+                    log("CAMERA", "trigger from %s skipped: %d photos in the last minute" % (node_id, MAX_PHOTOS_PER_MINUTE))
                 else:
-                    last_photo[node_id] = time.time()
+                    last_photo[node_id] = now
+                    recent_photos.append(now)
                     try:
                         handle_trigger(camera, node_id, source, payload)
                     except Exception as e:   # camera problems never stop the bridge

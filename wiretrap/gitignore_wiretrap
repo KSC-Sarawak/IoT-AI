@@ -1,0 +1,6 @@
+bridge_secrets.py
+secrets.h
+/captures
+__pycache__/
+*.pyc
+ca.crt

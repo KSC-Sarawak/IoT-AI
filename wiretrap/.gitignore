@@ -1,4 +1,5 @@
 bridge_secrets.py
+bridge_secrets.pyc
 secrets.h
 /captures
-/_pycache_
+/__pycache__

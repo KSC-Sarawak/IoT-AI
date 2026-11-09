@@ -17,17 +17,20 @@
  *   - "DHT sensor library" by Adafruit
  *   - "PubSubClient" by Nick O'Leary
  *
- * Put WIFI_SSID, WIFI_PASSWORD and NODE_ID in secrets.h (gitignored).
+ * Put WIFI_SSID, WIFI_PASSWORD, NODE_ID, MQTT_PASSWORD and ROOT_CA in secrets.h (gitignored).
  */
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 #include "DHT.h"
 #include "secrets.h"
 
-// ---------- MQTT (public test broker for now; TLS + Mosquitto later, CTIP-60)
-const char* MQTT_BROKER = "broker.hivemq.com";
-const int   MQTT_PORT   = 1883;
+// ---------- MQTT: team Mosquitto broker on the laptop, TLS + login (CTIP-60, F-14)
+// Login: username = NODE_ID, password = MQTT_PASSWORD. ROOT_CA = contents of
+// infra/mosquitto/certs/ca.crt. All three are in secrets.h (gitignored).
+const char* MQTT_BROKER = "192.168.137.1"; // laptop IP on its hotspot (check with ipconfig)
+const int   MQTT_PORT   = 8883;            // TLS only
 
 // ---------- Timing
 const unsigned long PUBLISH_INTERVAL_MS = 10000; // normal reading interval
@@ -70,7 +73,7 @@ const int SOIL_DRY_RAW = 3800;
 const int SOIL_WET_RAW = 1300;
 
 DHT dht(DHTPIN, DHTTYPE);
-WiFiClient espClient;
+WiFiClientSecure espClient;   // TLS (was WiFiClient)
 PubSubClient mqttClient(espClient);
 
 char topic[96];
@@ -138,13 +141,15 @@ void connectMQTT() {
   if (mqttClient.connected() || millis() - lastMqttTry < MQTT_RETRY_MS) return;
   lastMqttTry = millis();
 
-  String clientId = "esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (time(nullptr) < 1700000000) return;  // wait for NTP time before TLS
+
+  // Client ID and username are both NODE_ID (matches the broker login and acl)
   Serial.printf("MQTT: connecting to %s:%d as %s ... ",
-                MQTT_BROKER, MQTT_PORT, clientId.c_str());
-  if (mqttClient.connect(clientId.c_str())) {
+                MQTT_BROKER, MQTT_PORT, NODE_ID);
+  if (mqttClient.connect(NODE_ID, NODE_ID, MQTT_PASSWORD)) {
     Serial.println("OK");
   } else {
-    // -4 timeout, -2 network failed, 5 not authorised
+    // -4 timeout, -2 network or TLS failed, 4 bad username/password, 5 not authorised
     Serial.printf("failed, rc=%d\n", mqttClient.state());
   }
 }
@@ -350,6 +355,7 @@ void setup() {
   Serial.printf("Topic: %s\n", topic);
   Serial.printf("Trigger topic: %s\n", triggerTopic);
 
+  espClient.setCACert(ROOT_CA);   // only trust the team broker's certificate
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setBufferSize(512); // default 256 is tight for JSON
   mqttClient.setKeepAlive(30);
